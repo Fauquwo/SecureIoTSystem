@@ -10,11 +10,13 @@ from cryptography.hazmat.backends import default_backend
 from ascon import ascon_encrypt, ascon_decrypt
 
 SERVER_URL = "http://localhost:5000/"
+TTP_URL = "http://localhost:6000/ttp_generate_key"  # TTP como servicio externo
+
 SEND_INTERVAL = 5
 SHARED_KEYS = {
     "aes": b"claveaesclaveaes",        # 16 bytes (AES-128)
     "chacha": b"clavesecretachacha20clave1234567",  # 32 bytes (ChaCha20)
-    "ascon": b"asconclave123456"  # 16 bytes
+    "ascon": b"asconclave123456"  # 16 bytes (Ascon)
 }
 
 def generate_sensor_data(device_id):
@@ -88,6 +90,7 @@ def authenticate():
     nonce = f"nonce-{int(time.time())}".encode()
     enc_nonce, iv = ascon_encrypt_message(nonce, SESSION_KEY)
     resp = requests.post(f"{SERVER_URL}/server_auth", json={"nonce": enc_nonce, "iv": iv})
+    resp.raise_for_status()
     decrypted = ascon_decrypt_message(resp.json()['response'], resp.json()['iv'], SESSION_KEY).decode()
     if decrypted == nonce.decode() + "OK":
         print("Autenticación mutua completada con éxito")
@@ -109,15 +112,19 @@ def simulator(device_id, algorithm):
 
 def iniciar_sesion_y_autenticar():
     global SESSION_KEY
-    print("[ESP32] Solicitando clave al TTP...")
-    r = requests.post(f"{SERVER_URL}/ttp_generate_key").json()
-    key = r['to_esp32']['key']
-    iv = r['to_esp32']['iv']
-    SESSION_KEY = ascon_decrypt_message(key, iv, KEY_ESP32_TTP)
-    print("[ESP32] Clave de sesión establecida")
-
-    requests.post(f"{SERVER_URL}/server_receive_key", json=r['to_server'])
-    authenticate()
+    print("[ESP32] Solicitando clave al TTP externo...")
+    response = requests.post(TTP_URL)
+    if response.status_code == 200:
+        data = response.json()
+        enc = data['to_esp32']['key']
+        iv = data['to_esp32']['iv']
+        SESSION_KEY = ascon_decrypt_message(enc, iv, KEY_ESP32_TTP)
+        print("[ESP32] Clave de sesión establecida")
+        # Luego notifica al servidor
+        requests.post(f"{SERVER_URL}/server_receive_key", json=data['to_server'])
+        authenticate()
+    else:
+        print("Error al obtener la clave desde TTP")
 
 
 if __name__ == '__main__':

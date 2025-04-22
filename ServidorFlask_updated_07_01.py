@@ -1,59 +1,20 @@
 import os
+import time
 import pandas as pd
-import json
 import requests
 from flask import Flask, request, jsonify, render_template_string, session, redirect, url_for
-from datetime import datetime
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.backends import default_backend
-from base64 import b64encode, b64decode
-from ascon import ascon_encrypt, ascon_decrypt
-from os import urandom
-
-TTP_URL = "http://localhost:6000/ttp_generate_key"  # TTP como servicio externo
-KEY_SERVER_TTP = b"serversharedkey!" # 16 bytes
-
-SHARED_KEYS = {
-    "aes": b"claveaesclaveaes",
-    "chacha": b"clavesecretachacha20clave1234567",
-    "ascon": b"asconclave123456"
-}
-
-SESSION_KEY = None
-
-def ascon_encrypt_message(msg: bytes, key: bytes):
-    nonce = urandom(16)
-    ct = ascon_encrypt(key, nonce, b"", msg)
-    return b64encode(ct).decode(), b64encode(nonce).decode()
-
-def ascon_decrypt_message(ct_b64: str, nonce_b64: str, key: bytes):
-    ct = b64decode(ct_b64)
-    nonce = b64decode(nonce_b64)
-    return ascon_decrypt(key, nonce, b"", ct)
-
-def decrypt_payload(enc_b64, iv_b64, algorithm):
-    backend = default_backend()
-    if algorithm == "aes":
-        key = SHARED_KEYS["aes"]
-        encrypted = b64decode(enc_b64)
-        iv = b64decode(iv_b64)
-        cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=backend)
-        decrypted = cipher.decryptor().update(encrypted) + cipher.decryptor().finalize()
-        return decrypted.rstrip(b"\x00").decode()
-    elif algorithm == "chacha":
-        key = SHARED_KEYS["chacha"]
-        encrypted = b64decode(enc_b64)
-        nonce = b64decode(iv_b64)
-        cipher = Cipher(algorithms.ChaCha20(key, nonce), mode=None, backend=backend)
-        decrypted = cipher.decryptor().update(encrypted)
-        return decrypted.decode()
-    elif algorithm == "ascon":
-        return ascon_decrypt_message(enc_b64, iv_b64, SESSION_KEY).decode()
-    else:
-        raise ValueError("Algoritmo no soportado")
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
 app.secret_key = "your_secret_key"  # Usado para la gestión de sesiones
+
+# Configuración
+INFLUX_URL = "127.0.0.1"
+INFLUX_TOKEN = "5phA3e3E8SU6k02r7wzj3_HcmIMQmuyVclu1X-aYnGwoUfayYXYjqbeYEJNMVnETvWK1p-j0FDqppFuzohA37Q=="
+ORG = "SistemasinformaticosIoT"
+BUCKET_NAME = "bucket3"
+QUERY_URI = 'http://{}:8086/api/v2/write?org={}&bucket={}&precision=ms'.format(INFLUX_URL,ORG,BUCKET_NAME)
+HEADERS = {'Authorization': f'Token {INFLUX_TOKEN}'}
 
 # Directorio para almacenar los archivos CSV
 CSV_DIR = "csv_data"
@@ -101,11 +62,16 @@ def append_sensor_data(data):
         df.to_csv(CSV_FILE_PATH, mode="a", index=False, header=True)
     else:
         df.to_csv(CSV_FILE_PATH, mode="a", index=False, header=False)
+    
+    influx_data = f"sensor_data temperature={data_with_timestamp['temperature']},humidity={data_with_timestamp['humidity']},pressure={data_with_timestamp['pressure']},altitude={data_with_timestamp['altitude']},light={data_with_timestamp['light']},door_angle={data_with_timestamp['door_angle']}"
+    response = requests.post(QUERY_URI, data=influx_data, headers=HEADERS)
+    if response.status_code != 204:
+        print(f"Error al enviar datos a InfluxDB: {response.status_code}, {response.text}")
 
 
 @app.route('/')
 def index():
-    door_status = "Abierta" if sensor_data['door_angle'] == 90 else "Cerrada"
+
     if 'logged_in' not in session or not session['logged_in']:
         return redirect(url_for('login'))
 
@@ -228,10 +194,6 @@ def index():
                     <th class="tg-l7yf"><strong>Luz</strong></th>
                     <td class="tg-0qe0">{{ light }} lux</td>
                 </tr>
-                <tr>
-                    <th class="tg-l7yf"><strong>Estado de puerta</strong></th>
-                    <td class="tg-0qe0">{{ door_status }} </td>
-                </tr>
             </table>
             <h2>Umbrales actuales</h2>
             <ul>
@@ -244,6 +206,7 @@ def index():
                 <button class="admin-only" onclick="modifyThreshold()">Modificar umbrales ambientales</button>
                 <button class="admin-only" onclick="controlDoor('open')">Abrir puerta</button>
                 <button class="admin-only" onclick="controlDoor('close')">Cerrar puerta</button>
+                <button onclick="viewInfluxDB()">Ver datos en InfluxDB</button>
                 <p id="response"></p>
                 </div>
         </div>
@@ -325,6 +288,20 @@ def index():
                 });
             }
 
+            function importCsv() {
+                fetch('/import_csv', {
+                    method: 'POST'
+                })
+                .then(response => response.json())
+                .then(data => {
+                    document.getElementById("response").innerText = data.message;
+                });
+            }
+
+            function viewInfluxDB() {
+                const influxDBUrl = `http://${window.location.hostname}:8086`;
+                window.open(influxDBUrl, '_blank');
+            }
             function checkDoorStatus() {
                 if(lastDoorActionTime){
                     const currentTime = new Date();
@@ -360,7 +337,6 @@ def index():
                                   light=sensor_data['light'] or 'No disponible',
                                   thresholds=thresholds,
                                   angle=motor_state['angle'],
-                                  door_status=door_status,
                                   role=role)
 
 @app.route('/login', methods=['GET', 'POST'])
@@ -399,36 +375,6 @@ def login():
     </body>
     </html>
     """
-
-# === RECIBIR CLAVE DE SESIÓN ===
-@app.route('/server_receive_key', methods=['POST'])
-def server_receive_key():
-    global SESSION_KEY
-    try:
-        data = request.get_json()
-        print("Recibido en /server_receive_key:", data)
-        enc = data['key']
-        iv = data['iv']
-        SESSION_KEY = ascon_decrypt_message(enc, iv, KEY_SERVER_TTP)
-        print("Clave de sesión establecida:", SESSION_KEY)
-        return jsonify({'message': 'OK'})
-    except Exception as e:
-        print("EXCEPCIÓN en /server_receive_key:", e)
-        return jsonify({'error': str(e)}), 500
-
-
-# === AUTENTICACIÓN MUTUA ===
-@app.route('/server_auth', methods=['POST'])
-def server_auth():
-    global SESSION_KEY
-    data = request.get_json()
-    enc_nonce = data['nonce']
-    iv = data['iv']
-    client_nonce = ascon_decrypt_message(enc_nonce, iv, SESSION_KEY).decode()
-    print("[Servidor] Nonce recibido:", client_nonce)
-    reply = (client_nonce + "OK").encode()
-    reply_ct, reply_iv = ascon_encrypt_message(reply, SESSION_KEY)
-    return jsonify({'response': reply_ct, 'iv': reply_iv})
 
 @app.route('/get_door_state')
 def get_door_state():
@@ -499,20 +445,49 @@ def control_motor():
         else:
             return '', 204
 
+@app.route('/import_csv', methods=['POST'])
+def import_csv():
+
+    # Importar datos desde un archivo CSV a InfluxDB
+    csv_files = sorted([f for f in os.listdir(CSV_DIR) if f.endswith('.csv')], reverse=True)
+    if not csv_files:
+        return jsonify({'error': 'No hay archivos CSV disponibles'}), 400
+
+    latest_csv = os.path.join(CSV_DIR, csv_files[0])
+    csvReader = pd.read_csv(latest_csv)
+    measurement_name = 'sensor_data'
+
+    for _, row in csvReader.iterrows():
+        dataE = [f'{measurement_name},temperature={row["temperature"]},humidity={row["humidity"]} ' +
+                 f'pressure={row["pressure"]},altitude={row["altitude"]},light={row["light"]}']
+        dataEnvio = '\n'.join(dataE)
+
+        # Realizar la solicitud POST
+        r = requests.post(QUERY_URI, data=dataEnvio, headers=HEADERS)
+        if r.status_code != 204:
+            return jsonify({'error': f'Error al enviar datos: {r.status_code}'}), 500
+
+        time.sleep(1)
+
+    return jsonify({'status': 'success', 'message': f'Datos importados desde {latest_csv} a InfluxDB'}), 200
+
 @app.route('/rt_measurements', methods=['POST'])
 def rt_measurements():
+    #Envío datos en TR desde la placa
     global sensor_data
-    try:
-        body = request.get_json()
-        decrypted = decrypt_payload(body['payload'], body['iv'], body['algorithm'])
-        new_data = json.loads(decrypted)
-        sensor_data.update(new_data)
-        print(f"Datos descifrados de {new_data.get('device_id', 'sin ID')}:", new_data)
-        append_sensor_data(sensor_data)
-        return "Datos cifrados recibidos correctamente", 200
-    except Exception as e:
-        print("Error al procesar datos cifrados:", e)
-        return "Error de descifrado", 400
+    new_data = request.get_json()
+    sensor_data.update(new_data)
+    print("---------------- He recibido --------------------")
+    print("Valor de Temperatura mediante POST: " + str(sensor_data['temperature']) + " *C")
+    print("Valor de Presion mediante POST: " + str(sensor_data['pressure']) + " hPa")
+    print("Valor de Altitud mediante POST: " + str(sensor_data['altitude']) + " m")
+    print("Valor de Humedad mediante POST: " + str(sensor_data['humidity']) + " %")
+    print("Valor de Luz mediante POST: " + str(sensor_data['light']) + " lux")
+    print("-------------------------------------------------")
+    
+
+    append_sensor_data(sensor_data)
+    return "Datos de sensores recibidos por el servidor correctamente", 200
 
 
 if __name__ == '__main__':
